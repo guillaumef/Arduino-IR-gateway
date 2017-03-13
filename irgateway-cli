@@ -1,0 +1,61 @@
+#!/usr/bin/perl
+
+use strict;
+
+use Socket;
+use IO::Socket;
+
+my $host = 'localhost';
+my $port = 54545;
+
+my $client;
+my $peer;
+
+$client = IO::Socket::INET->new(
+  Proto    => "udp",
+  Type     => SOCK_DGRAM,
+  PeerAddr    => $host,
+  PeerPort    => $port,
+) or die "unable to open socket: $!";
+
+&sendrecv( "status\n", 1 );
+
+if (@ARGV) {
+ &sendrecv( join(' ',@ARGV)."\n" );
+ exit(0);
+}
+
+while (<STDIN>) {
+ &sendrecv( $_ );
+}
+exit(0);
+
+
+
+sub sendrecv {
+ my ($cmd, $die) = @_;
+
+ if (! $client->send( $cmd )) {
+  if ($die) {
+   die "Failed to send $!";
+  }
+  else {
+   warn "Failed to send $!";
+  }
+ }
+
+ my $msg;
+ if (recv($client,$msg,1024,0))
+ {
+  print $msg;
+ }
+ else {
+  print "Failed to recv msg\n";
+  if ($die) {
+   exit(1);
+  }
+ }
+}
+
+1;
+__END__

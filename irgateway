@@ -1,0 +1,467 @@
+#!/usr/bin/perl
+
+use strict;
+use File::Copy qw( move );
+use Device::SerialPort qw( :PARAM :STAT 0.07 );
+use Data::Dumper();
+use Time::HiRes qw( usleep );
+use Socket;
+use IO::Socket;
+use POSIX();
+use vars qw/ $IRGATEWAY_DEVICE $IRGATEWAY_ACTIVITY /;
+
+my $USB_DEFAULT   = '/dev/ttyUSB0';
+my $HOST_DEFAULT  = '0.0.0.0';
+my $PORT_DEFAULT  = 54545;
+my $LOG_FILE      = '/var/log/irgateway.log';
+
+my $SLEEP_CMD     = 200; # millisec sleep between activity commands
+
+my @argv = @ARGV;
+my $conf = './irgateway.conf';
+my $daemon = 0;
+my $logfile = $LOG_FILE;
+
+# Sanity check
+
+# target
+my $usb = $USB_DEFAULT;
+while (@argv) {
+  if ($argv[0] eq '-d') {
+    shift @argv;
+    $usb = shift @argv;
+    next;
+  }
+  if ($argv[0] eq '-c') {
+    shift @argv;
+    $conf = shift @argv;
+    next;
+  }
+  if ($argv[0] eq '-s') {
+    shift @argv;
+    $daemon = 1;
+    next;
+  }
+  if ($argv[0] eq '-l') {
+    shift @argv;
+    $logfile = shift @argv;
+    next;
+  }
+  last;
+}
+
+# Load conf
+do "$conf";
+
+if (!($IRGATEWAY_DEVICE && $IRGATEWAY_ACTIVITY)) {
+  print STDERR "Missing configuration\n";
+  exit(1);
+}
+
+# Daemon check
+if ($daemon) {
+  if (&pid_get('self')) {
+    my $pid = &pid_get_running( 'self' );
+    kill 'TERM', $pid if ($pid);
+    while (&pid_get_running('self')) {
+      print STDERR ".";
+      sleep 1;
+    }
+    &pid_kill( $pid );
+    print STDERR ". stopped\n";
+  }
+
+  &daemonize();
+}
+
+# mode
+my $mode = shift @argv || '';
+$mode =~ s/^-+//;
+&usage() if (! $mode || substr($mode,0,1) eq 'h');
+
+# Ignore sig pipe
+#$SIG{PIPE} = sub {;};
+
+# Serial config
+my $ob = Device::SerialPort->new($usb, 1) || die "Can't open $usb: $!";
+$ob->can_arbitrary_baud;
+$ob->databits(8);
+$ob->baudrate(57600);
+$ob->parity("odd");
+$ob->can_stopbits;
+$ob->is_rs232;
+$ob->can_total_timeout;
+
+# Wait for connection
+while (1) {
+  $ob->write("c<");
+  my $line = &_readline_one();
+  if ($line eq 'r<ok') {
+   print "Connected\n";
+   last;
+  }
+}
+
+# modes
+my %h_mode = (
+  'learn'		=> sub { &learn( @_ ); return "done"; },
+  'raw-learn'		=> sub { my $s = &cmd_read( 'no-name' )||''; return "$s"; },
+
+  'send'		=> sub { &send( @_ ); },
+  'raw-send'		=> sub { &cmd_send( @_ ); },
+  'stdin-raw-send'	=> sub { while (<STDIN>) { chomp; print &cmd_send( $_ )."\n"; } },
+
+  'activity'  => sub { &activity( @_ ); },
+
+  'server'		=> sub { &server( @_ ); },
+
+  'status'    => sub { return 'Connected'; },
+  'exit'		=> sub { &pid_kill(&pid_get_running( 'self' )); &pid_del( 'self' ); exit(0); }
+);
+
+&usage() unless $h_mode{$mode};
+
+if ($mode ne 'learn') {
+  # Configuration have error
+  exit(1) if (&sanity());
+}
+
+print &{$h_mode{$mode}}(@argv)."\n";
+
+exit(0);
+
+###########################################################################
+
+### usage
+sub usage {
+ print STDERR <<EOF;
+$0 [OPTION] [MODE]
+
+Option: not mandatory
+ -d <device>                   : override device target ($USB_DEFAULT)
+ -c <conf file>                : override configuration file
+ -s                            : daemonize (for server mode)
+ -l <log file>                 : daemon log file (for server mode)
+
+Mode: mandatory
+ -learn                        : learn everything missing in configuration
+ -learn <device> <action>      : learn this device's action and save it
+ -raw-learn                    : learn and print - don't save it
+
+ -send <device> <action>       : send this device's action
+ -raw-send <code>              : send raw code from argument
+ -stdin-raw-send               : send raw code from stdin
+
+ -activity <activity> <action> : run this activity
+
+ -server <host> <port>         : server ($HOST_DEFAULT $PORT_DEFAULT)
+EOF
+ exit(0);
+}
+
+### _realine
+my @aread = ();
+sub _readline_one {
+  return shift @aread if (@aread);
+  $ob->read_char_time(0);
+  $ob->read_const_time(0);
+  my $buffer = '';
+  while (1) {
+    my ($cnt, $saw) = $ob->read(255);
+    $buffer .= $saw;
+    last if (substr($saw, length($saw)-1, 1) eq "\n");
+    usleep(1);
+  }
+  # remove last \r\n
+  chop($buffer); chop($buffer);
+  push @aread, (split /\r\n/,$buffer);
+  return shift @aread;
+}
+
+sub _readline {
+  for (;;) {
+   my $buffer = &_readline_one();
+
+   # type
+   my ($type) = ($buffer =~ /^(.)</);
+   $buffer = substr($buffer, (($type)?2:0));
+
+   if (! $type || $type eq 'l') {
+    print "$buffer\n";
+    next;
+   }
+
+   if ($type eq 'e') {
+    print STDERR "$buffer\n";
+    return undef;
+   }
+
+   if ($type eq 'r') {
+    return $buffer;
+   }
+
+   print STDERR "_readline: unknown type: $buffer\n";
+  }
+}
+
+### direct cmd for IR read
+sub cmd_read {
+  my $key = shift;
+  $ob->write("r<");
+  $ob->write_drain;
+  print "Waiting for key: $key\n";
+  my $ret = &_readline();
+
+  return undef unless (defined $ret);
+
+  # Content
+  print " > $ret\n";
+  return $ret;
+}
+
+### direct cmd for IR send
+sub cmd_send {
+  my $code = shift;
+  $ob->write("s$code<");
+  $ob->write_drain;
+  return &_readline();
+}
+
+### Send (device and key are mandatory)
+sub send {
+  my ($dev, $key) = @_;
+  my $rhdev = $IRGATEWAY_DEVICE->{$dev} || {};
+  my $code = $rhdev->{$key} || {};
+  if ($code) {
+    return &cmd_send( $code );
+  }
+  else {
+    return "Code for $dev>$key not found";
+  }
+}
+
+### Learn (device and key are not mandatory)
+sub learn {
+ my ($argdev, $argkey) = @_;
+ my ($dev, $rhdev);
+ while (($dev, $rhdev) = each %{$IRGATEWAY_DEVICE})
+ {
+  next if (defined $argdev && $argdev ne $dev);
+  my ($key, $keyact);
+  while (($key, $keyact) = each %{$rhdev})
+  {
+   if (
+    ((! defined $argkey) && ! $keyact)
+    ||
+    ((defined $argkey) && $argkey eq $key))
+   {
+    $keyact = &cmd_read( $dev.' > '.$key );
+    if ($keyact) {
+     $rhdev->{ $key } = $keyact;
+     &conf_save();
+    }
+   }
+  }
+ }
+}
+
+### Activity
+sub activity {
+  my ($activity, $action) = @_;
+  &usage() unless ($activity && $action);
+  my $radev = $IRGATEWAY_ACTIVITY->{$activity}->{$action};
+  my $postsleep = 1;
+  foreach my $rh (@{$radev}) {
+    my ($k, $v) = %{$rh};
+
+    if ($k eq 'sleep') {
+      usleep($v*1000);
+      $postsleep = 1;
+      next;
+    }
+
+    # Sleep between real command
+    usleep($SLEEP_CMD*1000) if (!$postsleep);
+    $postsleep = 0;
+
+    # Launch command
+    &send( $k, $v );
+  }
+  return "ok";
+}
+
+### Sanity check
+sub sanity {
+  my ($activity, $rhactivity);
+  my $err = 0;
+  while (($activity, $rhactivity) = each %{$IRGATEWAY_ACTIVITY})
+  {
+    my ($act, $radev);
+    while (($act, $radev) = each %{$rhactivity})
+    {
+      foreach my $rh (@{$radev}) {
+        my ($k,$v) = %{$rh};
+        if ($k eq 'sleep') {
+          if ($v !~ /^\d+$/) {
+            print STDERR "activity: $activity > $act: sleep takes number as argument\n";
+            $err ++;
+          }
+          next;
+        }
+        # Lookup
+        if (!exists $IRGATEWAY_DEVICE->{$k}) {
+          print STDERR "activity: $activity > $act: unknown device: $k\n";
+          $err ++;
+          next;
+        }
+        if (!exists $IRGATEWAY_DEVICE->{$k}->{$v}) {
+          print STDERR "activity: $activity > $act: unknown device action: $k>$v\n";
+          $err ++;
+          next;
+        }
+        if ($IRGATEWAY_DEVICE->{$k}->{$v} !~ /^(?:[0-9]+@[0-9]+#|)[0-9]+[*]\([0-9,]+\)$/) {
+          print STDERR "device action wrong format: $k > $v\n";
+          $err ++;
+        }
+      }
+    }
+  }
+  return $err;
+}
+
+### Server
+sub server {
+ my ($host, $port) = @_;
+
+ my $sock;
+ my $isunix = 1;
+
+ $host ||= $HOST_DEFAULT;
+ $port ||= $PORT_DEFAULT;
+
+ $sock = IO::Socket::INET->new(
+   Proto     => "udp",
+   LocalAddr => $host,
+   LocalPort => $port,
+   Type      => SOCK_DGRAM,
+   ReuseAddr => 1
+ ) or die "unable to open socket: $!";
+
+ print "Server running: $host $port\n";
+ for(;;) {
+  my $msg = '';
+  my $peer = $sock->recv($msg,1024,0);
+  if (defined($peer)) {
+    chomp($msg);
+   my @arg = split / +/, $msg;
+   my $mode = shift @arg;
+   if (exists $h_mode{$mode}) {
+    my $ret = &{$h_mode{$mode}}(@arg);
+    send( $sock, "$ret\n", 0, $peer );
+   }
+   else {
+    send( $sock, "unknown command\n", 0, $peer ) || warn "Failed to send: $!";
+   }
+  }
+ }
+
+ close $sock;
+
+ if ($isunix) {
+  unlink $host;
+ }
+ return "end";
+}
+
+##
+# Pid & Daemon
+#
+sub pid_path {
+  return "/var/run/irgateway-".$_[0].".pid";
+}
+sub pid_set {
+  my ($key, $pid) = @_;
+  open FH, ">".&pid_path($key);
+  print FH $pid."\n";
+  close FH;
+}
+sub pid_get {
+  my ($key) = @_;
+  open FH, &pid_path($key) || return 0;
+  my $pid = <FH>;
+  close FH;
+  chomp $pid;
+  return $pid;
+}
+sub pid_del {
+  unlink &pid_path($_[0]);
+}
+sub pid_running {
+  return ((-e "/proc/".$_[0]) ? 1 : 0);
+}
+sub pid_get_running {
+  my ($key) = @_;
+  my $pid = &pid_get( $key );
+  return $pid if ($pid && &pid_running($pid));
+  return 0;
+}
+sub pid_kill {
+  my (@apid) = @_;
+  my @ap = ();
+  foreach my $pid (@apid) {
+    push @ap, $pid if ($pid>0 && &pid_running($pid));
+  }
+  if (@ap) {
+    kill 'TERM', @ap;
+    sleep 2;
+    kill 'KILL', @ap;
+  }
+}
+sub daemonize {
+  return unless $daemon;
+
+  if (&pid_get('self')) {
+    print STDERR ("Living pid".
+      "[$$] ".&pid_get('self')."\nexit (".&pid_path('self').")\n");
+    exit(1);
+  }
+
+  print "Daemon - stdout/stderr ($logfile)\n";
+  POSIX::setsid or die "setsid: $!";
+  my $pid = fork();
+  if ($pid < 0) {
+    die "fork: $!";
+  } elsif ($pid) {
+    exit 0;
+  }
+  chdir "/";
+  umask 0;
+  foreach (0 .. (POSIX::sysconf (&POSIX::_SC_OPEN_MAX) || 1024)) {
+    POSIX::close $_;
+  }
+  open (STDIN, "</dev/null");
+  open (STDOUT, ">>$logfile");
+  open (STDERR, ">&STDOUT");
+
+  &pid_set( 'self' => $$ );
+
+  $SIG{INT} = $SIG{TERM} = sub {
+    &pid_del( 'self' );
+    exit(0);
+  };
+}
+
+### Save configuration
+sub conf_save {
+  rename $conf, $conf.".bk";
+  open FH, ">$conf";
+  print FH "# vim: set ft=perl:\n\n";
+  $Data::Dumper::Indent = 1;
+  print FH Data::Dumper->Dump(
+    [ $IRGATEWAY_DEVICE, $IRGATEWAY_ACTIVITY ],
+    [ qw/IRGATEWAY_DEVICE IRGATEWAY_ACTIVITY/ ]);
+  close FH;
+}
+
+1;
+__END__
