@@ -3,13 +3,15 @@ Arduino IR transceiver - register ir commands, prepare devices, activities and t
 
 Transforms an arduino in an IR receiver for learning codes and able to emit back any code learned.
 The usb attached arduino make the whole processing available to the perl code 'irgateway'.
-This arduino receiver code should be able to decode any IR remote. It implements its own decoding layer without the need of IRremote.
+This arduino receiver code should be able to decode any IR remote. It implements its own decoding layer without the need of IRremote (which was failing on some of my gear).
 For the transmitter, IRremote does the job.
+
+For ~$15, It can replace any IR universal remote for activity management.
 
 ## Requirements
 
 arduino-mk
-arduino IRremote library (only used for emitter)
+arduino IRremote library (only for emitter)
 
 ## Build
 ```shell
